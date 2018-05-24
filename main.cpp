@@ -5,12 +5,12 @@
 #include <cstdlib>
 #include <iostream>
 #include <errno.h>
+#include <winsock2.h>
 #include <windows.h>
 #include <winioctl.h>
 #include <stdio.h>
 #include <getopt.h>
 #include <fstream>
-#include <winsock2.h>
 #include <algorithm>
 #include <stdint.h>
 #include <cstdarg>
@@ -20,10 +20,12 @@ using namespace std;
 bool debug=false;
 bool quiet=false;
 bool allowWrite = false;
+bool noReadError=false;
 bool bMemory = false;
 string nbdfilename = "";
 int partitionNo=0;
 ofstream debugFile;
+unsigned long long overridesize=0;
 
 //pmem windows memory driver defines
 #define PMEM_DEVICE_NAME "pmem"
@@ -98,6 +100,8 @@ void usage(char *prog)
      cout<<" -f     File to serve ( \\\\.\\PHYSICALDRIVE0 or \\\\.\\pmem for example)"<<endl;  //escaping \'s should be read as \\.\:
      cout<<" -n     Partition on disk to serve (0 if not specified), -n all to serve all partitions"<<endl;
      cout<<" -w     Enable writing (disabled by default)"<<endl;
+     cout<<" -z     No read error (return zeroes instead)"<<endl;
+     cout<<" -s     Device size (override device size)"<<endl;
      cout<<" -d     Enable debug messages"<<endl;
      cout<<" -q     Be Quiet..no messages"<<endl;
      cout<<" -h     This help text"<<endl;
@@ -303,7 +307,7 @@ DWORD WINAPI blockServe(LPVOID data){
 			DWORD dwplBytesReturn = 0;
 			if (DeviceIoControl(fh, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0,(LPVOID)&pLength,dwplSize,&dwplBytesReturn,NULL)){
 				debugLog(sformat("DiskLength: %lld",pLength.Length.QuadPart));
-				fsize.QuadPart=pLength.Length.QuadPart;
+  		  fsize.QuadPart=pLength.Length.QuadPart;
 			}else{
 				errorLog(sformat("Cannot determine Disk length. Error: %u", GetLastError()));
 				goto error;
@@ -370,7 +374,8 @@ DWORD WINAPI blockServe(LPVOID data){
 			goto error;
 		}
 	}
-
+  if (overridesize != 0)
+    fsize.QuadPart = overridesize;
 	/* negotiate */
 	debugLog("Negotiating...sending NBDMAGIC header");
 	if (WRITE(sockh, (unsigned char *)"NBDMAGIC", 8) != 8)
@@ -610,8 +615,16 @@ DWORD WINAPI blockServe(LPVOID data){
                 		}
         				if (ReadFile(fh, buffer, nb, &dummy, NULL) == 0)
         				{
-        					errorLog(sformat("Failed to read from %s: %lu", filename, GetLastError()));
-        					break;
+                  if ( noReadError )
+                  {
+                    memset(&buffer,0x00,nb);
+                    dummy = nb;
+                  }
+                  else
+                  {
+        					 errorLog(sformat("Failed to read from %s: %lu", filename, GetLastError()));
+        					 break;
+                  }
         				}
                     }
                     cur_offset.QuadPart+=nb;
@@ -619,10 +632,18 @@ DWORD WINAPI blockServe(LPVOID data){
     				// read nb to buffer;
     				if (ReadFile(fh, buffer, nb, &dummy, NULL) == 0)
     				{
-    					errorLog(sformat("Failed to read from %s: %u", filename, GetLastError()));
-    					break;
+              if ( noReadError )
+              {
+                 memset(&buffer,0x00,nb);
+                 dummy = nb;
+              }
+              else
+               {
+    					  errorLog(sformat("Failed to read from %s: %u", filename, GetLastError()));
+    					  break;
+               }
     				}
-    				if (dummy != nb)
+    				if (dummy != nb && !noReadError )
     				{
     					errorLog(sformat("Failed to read from %s: %u", filename, GetLastError()));
     					break;
@@ -678,7 +699,7 @@ int main(int argc, char *argv[])
     int iError;
     size_t found;
 
-    while ((ch=getopt(argc,argv,"c:p:f:n:hwdq")) != EOF)
+    while ((ch=getopt(argc,argv,"c:p:s:f:n:hwdqz")) != EOF)
     switch(ch)
     {
         case 'c':
@@ -693,8 +714,14 @@ int main(int argc, char *argv[])
         case 'w':
             allowWrite=true;
             break;
+        case 'z':
+            noReadError=true;
+            break;
         case 'p':
             port=atoi(optarg);
+            break;
+        case 's':
+            overridesize=atoll(optarg);
             break;
         case 'n':
 			//grab a particular partition, or all partitions
